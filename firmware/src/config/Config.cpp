@@ -44,6 +44,7 @@ void Config::load() {
     wifiPass = getStr("wifi_pass", "");
     String ipStr = getStr("tv_ip", "");
     tvPort = getU16("tv_port", 5555);
+    tvMac = getStr("tv_mac", "18:ef:3a:89:2b:c9");
     transport = getStr("transport", "adb");
 
     mqttServer = getStr("mqtt_server", "");
@@ -71,6 +72,7 @@ void Config::load() {
         tvIp.fromString(ipStr);
     }
     if (tvPort == 0) tvPort = 5555;
+    if (tvMac.length() == 0) tvMac = "18:ef:3a:89:2b:c9";
     if (transport.length() == 0) transport = "adb";
 }
 
@@ -81,6 +83,7 @@ bool Config::save() {
     p.putString("wifi_pass", wifiPass.c_str());
     p.putString("tv_ip", tvIp.toString().c_str());
     p.putUShort("tv_port", tvPort);
+    p.putString("tv_mac", tvMac.c_str());
     p.putString("transport", transport.c_str());
     p.putString("mqtt_server", mqttServer.c_str());
     p.putUShort("mqtt_port", mqttPort);
@@ -96,9 +99,10 @@ void Config::setWifi(const String& ssid, const String& pass) {
     wifiPass = pass;
 }
 
-void Config::setTv(const IPAddress& ip, uint16_t port) {
+void Config::setTv(const IPAddress& ip, uint16_t port, const String& mac) {
     tvIp = ip;
     tvPort = port ? port : 5555;
+    if (mac.length() > 0) tvMac = mac;
 }
 
 void Config::setTransport(const String& t) {

@@ -5,13 +5,16 @@
 #include "config/Config.h"
 #include "transport/ITvTransport.h"
 #include "transport/adb/AdbTransport.h"
+#include "transport/remotev2/RemoteV2Transport.h"
 #include "transport/remotev2/crypto/DeviceIdentity.h"
+#include "transport/WakeupHelper.h"
 
 // ==========================================
 // ГЛОБАЛЬНЫЕ КОМПОНЕНТЫ
 // ==========================================
-// Транспорт выбирается из Config (NVS). Сейчас доступен только ADB; v2 подключается на этапе P3.
+// Транспорт выбирается из Config (NVS): "adb" | "remote_v2".
 AdbTransport adb;
+RemoteV2Transport remoteV2;
 ITvTransport* tv = &adb;
 
 WebServer server(80);
@@ -344,6 +347,7 @@ const char SETUP_HTML[] PROGMEM = R"rawliteral(
  <label>Wi-Fi SSID</label><input name="ssid" placeholder="имя сети">
  <label>Wi-Fi пароль</label><input name="pass" placeholder="пароль сети">
  <label>IP телевизора</label><input name="tv_ip" placeholder="192.168.0.26">
+ <label>MAC-адрес телевизора (для WoWLAN)</label><input name="tv_mac" placeholder="18:ef:3a:89:2b:c9">
  <label>Порт</label><input name="tv_port" type="number" placeholder="5555 / 6466">
  <label>Транспорт</label>
  <select name="transport"><option value="adb">ADB (MVP)</option><option value="remote_v2">Google TV Remote v2</option></select>
@@ -387,7 +391,9 @@ void handleCmd() {
     Serial.printf("[WEB] Команда: %s\n", act.c_str());
 
     TvResult res;
-    if (act == "settings") {
+    if (act == "power" || act == "wake") {
+        res = WakeupHelper::wake(tv, config.tvIp, config.tvPort, config.tvMac);
+    } else if (act == "settings") {
         if (String(tv->serviceType()) == "adb") {
             AdbShellResult r = adb.rawShell("am start -a android.settings.SETTINGS");
             res.ok = r.ok;
@@ -418,6 +424,13 @@ void handleSearch() {
     }
     Serial.printf("[WEB] Search: %s\n", q.c_str());
     TvResult res = tv->search(q);
+    String resp = String(res.ok ? "OK" : "ERROR") + (res.detail.length() ? (": " + res.detail) : "");
+    server.send(200, "text/html", htmlEscape(resp));
+}
+
+void handleWake() {
+    Serial.println("[WEB] Вызов /api/wake");
+    TvResult res = WakeupHelper::wake(tv, config.tvIp, config.tvPort, config.tvMac);
     String resp = String(res.ok ? "OK" : "ERROR") + (res.detail.length() ? (": " + res.detail) : "");
     server.send(200, "text/html", htmlEscape(resp));
 }
@@ -473,6 +486,7 @@ void handleStatus() {
     String json = "{";
     json += "\"ip\": \"" + WiFi.localIP().toString() + "\",";
     json += "\"tv_ip\": \"" + config.tvIp.toString() + "\",";
+    json += "\"tv_mac\": \"" + config.tvMac + "\",";
     json += "\"transport\": \"" + String(tv->serviceType()) + "\",";
     json += "\"rssi\": " + String(WiFi.RSSI()) + ",";
     json += "\"tv_connected\": " + String(tv->isConnected() ? "true" : "false");
@@ -519,9 +533,9 @@ void handleSetupSave() {
     if (server.hasArg("tv_ip")) {
         IPAddress ip;
         if (ip.fromString(server.arg("tv_ip"))) config.setTv(ip, (uint16_t)server.arg("tv_port").toInt());
-    } else if (server.hasArg("tv_port")) {
-        config.tvPort = (uint16_t)server.arg("tv_port").toInt();
     }
+    if (server.hasArg("tv_port")) config.tvPort = (uint16_t)server.arg("tv_port").toInt();
+    if (server.hasArg("tv_mac")) config.tvMac = server.arg("tv_mac");
     if (server.hasArg("transport")) config.setTransport(server.arg("transport"));
     bool ok = config.save();
     server.send(200, "text/html",
@@ -533,9 +547,81 @@ void handleSetupSave() {
     }
 }
 
+// Фоновая генерация идентичности v2 (RSA-2048 ~100-200с на C3) — вне loop() (AGENTS 6.1).
+static volatile bool gIdentityBusy = false;
+static void identityTask(void*) {
+    gIdentityBusy = true;
+    bool ok = deviceIdentity.ensure("Alice TV Remote");
+    Serial.printf("[ID] фоновая генерация идентичности: %s (cert=%u key=%u)\n",
+                  ok ? "OK" : "FAIL", deviceIdentity.certLen(), deviceIdentity.keyLen());
+    gIdentityBusy = false;
+    vTaskDelete(NULL);
+}
+
 // Неблокирующее обслуживание транспорта в loop(). Для ADB — no-op (соединение
-// устанавливается по требованию в execShell). Заполнится v2-стейт-машиной на P2/P3.
-void tvTick() {}
+// устанавливается по требованию в execShell); для v2 — крутим стейт-машину
+// pairing/control поверх общего TLS-синглтона.
+void tvTick() {
+    if (tv == &remoteV2) remoteV2.tick();
+}
+
+// ---- Google TV Remote v2: сопряжение (PIN) через веб-UI (P3) ----
+void handlePairingStatus() {
+    bool isV2 = (tv == &remoteV2);
+    String json = "{";
+    json += "\"transport\": \"" + String(tv->serviceType()) + "\",";
+    json += "\"identity_ready\": " + String(deviceIdentity.isReady() ? "true" : "false") + ",";
+    json += "\"identity_busy\": " + String(gIdentityBusy ? "true" : "false") + ",";
+    json += "\"v2\": " + String(isV2 ? "true" : "false") + ",";
+    json += "\"paired\": " + String((isV2 && remoteV2.isPaired()) ? "true" : "false") + ",";
+    json += "\"control_ready\": " + String((isV2 && remoteV2.isReady()) ? "true" : "false") + ",";
+    json += "\"awaiting_pin\": " + String((isV2 && remoteV2.pairingAwaitingPin()) ? "true" : "false") + ",";
+    json += "\"current_app\": \"" + htmlEscape(isV2 ? remoteV2.currentApp() : String("")) + "\"";
+    json += "}";
+    server.send(200, "application/json", json);
+}
+
+void handlePairingStart() {
+    if (tv != &remoteV2) { server.send(400, "text/plain", "транспорт не remote_v2"); return; }
+    if (!deviceIdentity.isReady()) {
+        server.send(409, "text/plain", "идентичность ещё генерируется в фоне; подождите завершения и повторите");
+        return;
+    }
+    bool ok = remoteV2.startPairing("Alice TV");
+    server.send(200, "text/html", ok ? "pairing started" : "уже сопряжение идёт");
+}
+
+void handlePairingPin() {
+    if (tv != &remoteV2) { server.send(400, "text/plain", "транспорт не remote_v2"); return; }
+    if (!server.hasArg("pin")) { server.send(400, "text/plain", "Missing pin"); return; }
+    bool ok = remoteV2.submitPin(server.arg("pin"));
+    server.send(200, "text/html", htmlEscape(ok ? "pin accepted" : "pin rejected"));
+}
+
+void handlePairingPage() {
+    const char* page = R"rawliteral(<!DOCTYPE html><html lang=ru><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1"><title>Сопряжение v2</title>
+<style>body{font-family:system-ui;background:#090d16;color:#f8fafc;padding:16px}
+.card{background:#16203a;border-radius:12px;padding:16px;max-width:420px;margin:auto}
+input,button{font-size:18px;padding:10px;margin:6px 0;width:100%}
+#st{white-space:pre-wrap;font-size:14px;color:#94a3b8}</style></head>
+<body><div class=card><h3>Сопряжение Google TV (PIN)</h3>
+<div id=st>загрузка…</div>
+<button onclick=pair()>Начать сопряжение</button>
+<input id=pin inputmode=text maxlength=6 placeholder="6 hex-символов с экрана ТВ">
+<button onclick=sendpin()>Отправить PIN</button></div>
+<script>
+async function refresh(){try{let r=await fetch('/api/pairing/status');let j=await r.json();
+document.getElementById('st').textContent=
+"идентичность: "+(j.identity_ready?"готова":"генерируется…")+"\nсопряжён: "+j.paired+
+"\ncontrol готов: "+j.control_ready+"\nждём PIN: "+j.awaiting_pin+"\nтекущ. приложение: "+j.current_app;
+} catch(e){document.getElementById('st').textContent='ошибка статуса';}}
+async function pair(){await fetch('/api/pairing/start');refresh();}
+async function sendpin(){let p=document.getElementById('pin').value.trim();await fetch('/api/pairing/pin?pin='+encodeURIComponent(p));refresh();}
+refresh();setInterval(refresh,2000);
+</script></body></html>)rawliteral";
+    server.send(200, "text/html", page);
+}
 
 void setup() {
     Serial.begin(115200);
@@ -550,7 +636,13 @@ void setup() {
                   config.wifiSsid.c_str(), config.tvIp.toString().c_str(), config.tvPort, config.transport.c_str());
 
     if (config.transport == "remote_v2") {
-        Serial.println("[CFG] remote_v2 выбран, но v2-транспорт будет подключён на этапе P3; временно используется ADB.");
+        tv = &remoteV2;
+        Serial.println("[CFG] транспорт: Google TV Remote v2 (control 6466 / pairing 6467).");
+        // Тяжёлый RSA-keygen уводим в фоновую задачу, чтобы loop() не блокировался.
+        if (!deviceIdentity.isReady()) {
+            xTaskCreate(identityTask, "idgen", 16384, NULL, 1, NULL);
+        }
+    } else {
         tv = &adb;
     }
 
@@ -579,7 +671,28 @@ void setup() {
         Serial.printf("[WiFi] AP '%s', страница настройки: http://%s/setup\n", AP_SSID, WiFi.softAPIP().toString().c_str());
     }
 
-    // Инициализация соединения с ТВ (транспорт ADB).
+    // Запускаем веб-сервер до сетевых запросов к ТВ, чтобы UI был доступен немедленно
+    server.on("/", HTTP_GET, handleRoot);
+    server.on("/api/cmd", HTTP_GET, handleCmd);
+    server.on("/api/wake", HTTP_GET, handleWake);
+    server.on("/api/search", HTTP_GET, handleSearch);
+    server.on("/api/key", HTTP_GET, handleKey);
+    server.on("/api/shell", HTTP_GET, handleShell);
+    server.on("/api/apps", HTTP_GET, handleApps);
+    server.on("/api/packages", HTTP_GET, handlePackages);
+    server.on("/api/status", HTTP_GET, handleStatus);
+    server.on("/api/debug/identity", HTTP_GET, handleDebugIdentity);
+    server.on("/pair", HTTP_GET, handlePairingPage);
+    server.on("/api/pairing/status", HTTP_GET, handlePairingStatus);
+    server.on("/api/pairing/start", HTTP_ANY, handlePairingStart);
+    server.on("/api/pairing/pin", HTTP_ANY, handlePairingPin);
+    server.on("/setup", HTTP_GET, handleSetupForm);
+    server.on("/setup", HTTP_POST, handleSetupSave);
+
+    server.begin();
+    Serial.println("[HTTP] Web-сервер запущен на порту 80.");
+
+    // Инициализация соединения с ТВ (фоновое или отложенное)
     if (config.isTvConfigured()) {
         Serial.println("[TV] Подключение к телевизору...");
         if (tv->begin(config.tvIp, config.tvPort)) {
@@ -588,21 +701,6 @@ void setup() {
             Serial.println("[TV] Предупреждение: подключение будет повторено при первой команде.");
         }
     }
-
-    server.on("/", HTTP_GET, handleRoot);
-    server.on("/api/cmd", HTTP_GET, handleCmd);
-    server.on("/api/search", HTTP_GET, handleSearch);
-    server.on("/api/key", HTTP_GET, handleKey);
-    server.on("/api/shell", HTTP_GET, handleShell);
-    server.on("/api/apps", HTTP_GET, handleApps);
-    server.on("/api/packages", HTTP_GET, handlePackages);
-    server.on("/api/status", HTTP_GET, handleStatus);
-    server.on("/api/debug/identity", HTTP_GET, handleDebugIdentity);
-    server.on("/setup", HTTP_GET, handleSetupForm);
-    server.on("/setup", HTTP_POST, handleSetupSave);
-
-    server.begin();
-    Serial.println("[HTTP] Web-сервер запущен на порту 80.");
 }
 
 void loop() {

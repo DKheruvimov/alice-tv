@@ -14,6 +14,7 @@ public:
     String wifiPass;
     IPAddress tvIp;
     uint16_t tvPort = 5555;
+    String tvMac = "18:ef:3a:89:2b:c9";
     String transport = "adb"; // "adb" | "remote_v2"
 
     // MQTT (контракт появится на этапе P4; поля закладываются сейчас).
@@ -32,7 +33,7 @@ public:
     bool isTvConfigured() const { return tvIp[0] != 0 || tvIp[1] != 0 || tvIp[2] != 0 || tvIp[3] != 0; }
 
     void setWifi(const String& ssid, const String& pass);
-    void setTv(const IPAddress& ip, uint16_t port);
+    void setTv(const IPAddress& ip, uint16_t port, const String& mac = "");
     void setTransport(const String& t);
 
 private:
