@@ -1,5 +1,16 @@
 .pio
+.qoder
 .vscode/.browse.c_cpp.db*
+
+# Локальные дев-дефолты стенда (Wi-Fi/ТВ) — не должны попадать в репозиторий (AGENTS 6.3)
+firmware/include/config/credentials.h
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# Секреты и локальные ключи/сертификаты
+adbkey*
+*.pem
+*.der
+*.ppk
+*.log
